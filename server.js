@@ -7,6 +7,16 @@
  *   - Duffel -> prix en direct temps réel, mais payant à l'usage en mode "live"
  * Le serveur n'utilise que les sources pour lesquelles une clé est configurée dans .env.
  * Sans clé Duffel, tout fonctionne normalement avec Travelpayouts seul.
+ *
+ * Installation :
+ *   1. npm install
+ *   2. Copier .env.example vers .env et renseigner TRAVELPAYOUTS_TOKEN (gratuit)
+ *   3. npm start   (démarre sur le port 3000 par défaut)
+ *
+ * Déploiement rapide (gratuit) : Render.com, Railway.app ou Fly.io
+ *   - Ajoute ce dossier comme repo Git
+ *   - "Start command": node server.js
+ *   - Renseigne les variables d'environnement du .env dans les settings du service
  */
 const express = require('express');
 const cors = require('cors');
@@ -17,12 +27,13 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const DUFFEL_TOKEN = process.env.DUFFEL_TOKEN || '';
+const DUFFEL_TOKEN = process.env.DUFFEL_TOKEN || ''; // clé "live" ou "test" depuis le dashboard Duffel
 const DUFFEL_BASE = 'https://api.duffel.com';
 
 const TP_TOKEN = process.env.TRAVELPAYOUTS_TOKEN || '';
 const TP_MARKER = process.env.TRAVELPAYOUTS_MARKER || '';
 
+// ---------- Duffel: recherche d'aéroports/villes (autocomplete) ----------
 async function duffelResolveAirport(keyword) {
   if (!DUFFEL_TOKEN) return [];
   const url = DUFFEL_BASE + '/places/suggestions?query=' + encodeURIComponent(keyword);
@@ -42,6 +53,7 @@ function duffelHeaders() {
   };
 }
 
+// ---------- Duffel: recherche de vols en direct (offer requests) ----------
 async function duffelSearchFlights({ origin, destination, date, returnDate, adults }) {
   if (!DUFFEL_TOKEN) return [];
   const slices = [{ origin, destination, departure_date: date }];
@@ -79,9 +91,10 @@ async function duffelSearchFlights({ origin, destination, date, returnDate, adul
   });
 }
 
+// ---------- Travelpayouts: prix les moins chers en cache (rapide, secours) ----------
 async function travelpayoutsSearch({ origin, destination, date }) {
   if (!TP_TOKEN) return [];
-  const month = (date || '').slice(0, 7);
+  const month = (date || '').slice(0, 7); // l'API travaille par mois
   const url = 'https://api.travelpayouts.com/v1/prices/cheap?' + new URLSearchParams({
     origin, destination, depart_date: month, token: TP_TOKEN, currency: 'eur'
   });
@@ -105,8 +118,9 @@ async function travelpayoutsSearch({ origin, destination, date }) {
   }));
 }
 
-const SERVER_VERSION = '2026-07-20-v3-citynames';
+const SERVER_VERSION = '2026-07-20-v6-history'; // change à chaque envoi pour vérifier le déploiement
 
+// ---------- Endpoints ----------
 app.get('/healthz', (req, res) => {
   res.json({
     ok: true,
@@ -116,6 +130,7 @@ app.get('/healthz', (req, res) => {
   });
 });
 
+// ---------- Résolution d'aéroports SANS clé : base publique Travelpayouts (gratuite, pas de token requis) ----------
 let airportCache = null, airportCacheAt = 0;
 async function loadAirportDB() {
   if (airportCache && Date.now() - airportCacheAt < 24 * 3600 * 1000) return airportCache;
@@ -131,7 +146,7 @@ async function loadCityDB() {
   const r = await fetch('https://api.travelpayouts.com/data/en/cities.json');
   if (!r.ok) throw new Error('cities.json fetch failed: ' + r.status);
   const list = await r.json();
-  cityCache = {};
+  cityCache = {}; // index par code ville pour lookup rapide
   list.forEach(c => { cityCache[c.code] = c.name; });
   cityCacheAt = Date.now();
   return cityCache;
@@ -148,11 +163,11 @@ async function loadCountryDB() {
 function norm(s) { return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
 async function freeResolveAirport(keyword) {
   const db = await loadAirportDB();
-  const cities = await loadCityDB().catch(() => ({}));
+  const cities = await loadCityDB().catch(() => ({})); // pas bloquant si indispo
   const q = norm(keyword);
   const scored = [];
   for (const a of db) {
-    if (a.iata_type && a.iata_type !== 'airport') continue;
+    if (a.iata_type && a.iata_type !== 'airport') continue; // ignore gares/bus si le champ existe
     const cityName = cities[a.city_code] || '';
     const name = norm(a.name), city = norm(cityName), code = norm(a.code);
     let score = -1;
@@ -164,6 +179,7 @@ async function freeResolveAirport(keyword) {
     else if (name.includes(q)) score = 50;
     if (score > 0) scored.push({ score, a, cityName });
   }
+  // recherche par PAYS (ex: "Mali" -> tous les aéroports du Mali, capitale en premier)
   if (!scored.length || scored[0].score < 90) {
     try {
       const countries = await loadCountryDB();
@@ -172,7 +188,7 @@ async function freeResolveAirport(keyword) {
         const inCountry = db.filter(a => a.country_code === match.code);
         inCountry.slice(0, 8).forEach(a => scored.push({ score: 70, a, cityName: cities[a.city_code] || '' }));
       }
-    } catch (e) {}
+    } catch (e) { /* pas grave si indispo, on garde les résultats déjà trouvés */ }
   }
   scored.sort((x, y) => y.score - x.score);
   const seen = new Set();
@@ -185,17 +201,95 @@ app.get('/api/resolve-airport', async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
     if (q.length < 2) return res.json({ results: [] });
-    let results = await freeResolveAirport(q);
-    if (!results.length && DUFFEL_TOKEN) results = await duffelResolveAirport(q);
+    let results = await freeResolveAirport(q); // toujours dispo, gratuit
+    if (!results.length && DUFFEL_TOKEN) results = await duffelResolveAirport(q); // complément si Duffel configuré
     res.json({ results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------- Estimation CO2 : distance réelle (coordonnées aéroports) x facteur d'émission standard aviation ----------
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+async function estimateCO2(originIata, destIata, cabinClass) {
+  try {
+    const db = await loadAirportDB();
+    const o = db.find(a => a.code === originIata), d = db.find(a => a.code === destIata);
+    if (!o || !d || !o.coordinates || !d.coordinates) return null;
+    const distanceKm = Math.round(haversineKm(o.coordinates.lat, o.coordinates.lon, d.coordinates.lat, d.coordinates.lon));
+    // facteur moyen aviation (méthodologie proche ICAO/DEFRA) : ~115g CO2/passager/km en économie, ajusté par classe et par courtes distances (moins efficientes)
+    let perKm = distanceKm < 1500 ? 0.15 : distanceKm < 3500 ? 0.11 : 0.09;
+    const classMult = { economy: 1, premium_economy: 1.3, business: 1.9, first: 2.6 }[cabinClass] || 1;
+    return { distanceKm, co2Kg: Math.round(distanceKm * perKm * classMult) };
+  } catch (e) { return null; }
+}
+
+// ---------- Carte des prix : vrais prix (cache) depuis une ville vers toutes les destinations connues ----------
+// ---------- Historique / évolution des prix : prix le moins cher réel, mois par mois ----------
+app.get('/api/price-history', async (req, res) => {
+  try {
+    const origin = (req.query.origin || '').trim().toUpperCase();
+    const destination = (req.query.destination || '').trim().toUpperCase();
+    if (origin.length < 3 || destination.length < 3) return res.status(400).json({ error: 'origin et destination requis' });
+    if (!TP_TOKEN) return res.json({ history: [], note: 'Travelpayouts non configuré sur le serveur.' });
+    const months = [];
+    const now = new Date();
+    for (let i = 0; i < 6; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      months.push(d.toISOString().slice(0, 7));
+    }
+    const history = [];
+    for (const month of months) {
+      try {
+        const url = 'https://api.travelpayouts.com/v1/prices/cheap?' + new URLSearchParams({
+          origin, destination, depart_date: month, token: TP_TOKEN, currency: 'eur'
+        });
+        const r = await fetch(url);
+        if (!r.ok) { history.push({ month, price: null }); continue; }
+        const d = await r.json();
+        const routes = (d.data && d.data[destination]) || {};
+        const prices = Object.values(routes).map(o => o.price).filter(p => typeof p === 'number');
+        history.push({ month, price: prices.length ? Math.min(...prices) : null });
+      } catch (e) { history.push({ month, price: null }); }
+    }
+    res.json({ history, origin, destination });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/price-map', async (req, res) => {
+  try {
+    const origin = (req.query.origin || '').trim().toUpperCase();
+    if (origin.length < 3) return res.status(400).json({ error: 'origin requis (code IATA)' });
+    if (!TP_TOKEN) return res.json({ points: [], note: 'Travelpayouts non configuré sur le serveur.' });
+    const url = 'https://api.travelpayouts.com/v1/city-directions?' + new URLSearchParams({ origin, currency: 'eur', token: TP_TOKEN });
+    const r = await fetch(url);
+    if (!r.ok) return res.json({ points: [] });
+    const d = await r.json();
+    const data = d.data || {};
+    const db = await loadAirportDB();
+    const cities = await loadCityDB().catch(() => ({}));
+    const byCode = {}; db.forEach(a => { if (!byCode[a.city_code]) byCode[a.city_code] = a; });
+    const points = Object.entries(data).map(([iata, info]) => {
+      const a = byCode[iata] || db.find(x => x.code === iata);
+      if (!a || !a.coordinates) return null;
+      return {
+        iata, price: info.price, lon: a.coordinates.lon, lat: a.coordinates.lat,
+        city: cities[a.city_code] || a.name
+      };
+    }).filter(Boolean).sort((a, b) => a.price - b.price).slice(0, 60);
+    res.json({ points, origin });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/search-flights', async (req, res) => {
   try {
-    const { origin, destination, date, returnDate, adults, flexDays } = req.body || {};
+    const { origin, destination, date, returnDate, adults, flexDays, cabinClass } = req.body || {};
     if (!origin || !destination || !date) return res.status(400).json({ error: 'origin, destination et date sont requis' });
 
+    // dates à tester (recherche flexible en option)
     const dates = [date];
     if (flexDays) {
       for (let i = 1; i <= flexDays; i++) {
@@ -207,6 +301,7 @@ app.post('/api/search-flights', async (req, res) => {
     const sourcesUsed = new Set();
     let offers = [];
 
+    // Duffel (live) — on limite à 3 dates pour rester rapide et limiter les coûts
     for (const d of dates.slice(0, 3)) {
       try {
         const r = await duffelSearchFlights({ origin, destination, date: d, returnDate, adults });
@@ -215,6 +310,7 @@ app.post('/api/search-flights', async (req, res) => {
       } catch (e) { console.error('Duffel error', e.message); }
     }
 
+    // Travelpayouts (cache, complément rapide)
     try {
       const r = await travelpayoutsSearch({ origin, destination, date });
       if (r.length) sourcesUsed.add('Travelpayouts');
@@ -225,8 +321,12 @@ app.post('/api/search-flights', async (req, res) => {
       return res.json({ count: 0, sources: [], note: 'Aucun vol trouvé pour ces critères (ou aucune source de données configurée sur le serveur).' });
     }
 
+    const co2 = await estimateCO2(origin, destination, cabinClass);
+    if (co2) offers.forEach(o => { o.distanceKm = co2.distanceKm; o.co2Kg = co2.co2Kg; o.co2Estimated = true; });
+
     offers.sort((a, b) => a.price - b.price);
     const cheapest = offers[0];
+    // "meilleur rapport" = pas trop cher (< 130% du moins cher) et le moins d'escales / trajet le plus court
     const candidates = offers.filter(o => o.price <= cheapest.price * 1.3);
     const bestValue = candidates.sort((a, b) => (a.stops - b.stops) || (a.price - b.price))[0];
     cheapest._cheapest = true;
